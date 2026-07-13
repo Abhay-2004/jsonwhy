@@ -24,6 +24,49 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 1)
         issues = json.loads(output.getvalue())
         self.assertEqual(issues[0]["path"], "$.tags")
+        self.assertEqual(issues[0]["json_pointer"], "/tags")
+
+    def test_pointer_output(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(["--path-style", "pointer", "{'a/b': {1, 2}}"])
+        self.assertEqual(result, 1)
+        self.assertIn("/a~1b:", output.getvalue())
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(["--path-style", "pointer", "{1, 2}"])
+        self.assertEqual(result, 1)
+        self.assertIn("<root>:", output.getvalue())
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(["--path-style", "pointer", "{('bad',): 1}"])
+        self.assertEqual(result, 1)
+        self.assertIn("<no JSON Pointer>:", output.getvalue())
+
+    def test_cli_diagnostic_limits(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(["--max-issues", "1", "[{1}, {2}]"])
+        self.assertEqual(result, 1)
+        self.assertIn("$[0]", output.getvalue())
+        self.assertNotIn("$[1]", output.getvalue())
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(["--max-depth", "0", "[[1]]"])
+        self.assertEqual(result, 1)
+        self.assertIn("max_depth=0", output.getvalue())
+
+    def test_invalid_cli_diagnostic_limits(self) -> None:
+        for option, value in (("--max-issues", "0"), ("--max-depth", "-1")):
+            with self.subTest(option=option):
+                errors = io.StringIO()
+                with redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+                    main([option, value, "{}"])
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("error:", errors.getvalue())
 
     def test_strict_flag_is_accepted(self) -> None:
         output = io.StringIO()

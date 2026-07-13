@@ -17,6 +17,8 @@ class JsonIssue:
         message: A concise explanation for humans.
         suggestion: A likely fix, when one can be offered safely.
         value_repr: A bounded, best-effort representation of the value.
+        json_pointer: The RFC 6901 location, or ``None`` when the location
+            cannot exist in a JSON document.
     """
 
     path: str
@@ -25,6 +27,7 @@ class JsonIssue:
     message: str
     suggestion: str | None
     value_repr: str
+    json_pointer: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation of this issue."""
@@ -36,6 +39,7 @@ class JsonIssue:
             "message": self.message,
             "suggestion": self.suggestion,
             "value_repr": self.value_repr,
+            "json_pointer": self.json_pointer,
         }
 
 

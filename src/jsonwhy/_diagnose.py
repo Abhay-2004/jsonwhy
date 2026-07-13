@@ -43,6 +43,33 @@ def _path_for_key(parent: str, key: object) -> str:
     return f"{parent}[<key {_safe_repr(key)}>]"
 
 
+def _pointer_token(key: object) -> str | None:
+    if isinstance(key, str):
+        return str.__str__(key)
+    if key is None:
+        return "null"
+    if isinstance(key, bool):
+        return str(key).lower()
+    if isinstance(key, int):
+        return int.__repr__(key)
+    if isinstance(key, float):
+        if math.isnan(key):
+            return "NaN"
+        if key == math.inf:
+            return "Infinity"
+        if key == -math.inf:
+            return "-Infinity"
+        return float.__repr__(key)
+    return None
+
+
+def _pointer_child(parent: str | None, token: str | None) -> str | None:
+    if parent is None or token is None:
+        return None
+    escaped = token.replace("~", "~0").replace("/", "~1")
+    return f"{parent}/{escaped}"
+
+
 class _Inspector:
     def __init__(
         self,
@@ -64,13 +91,14 @@ class _Inspector:
         self.ancestors: set[int] = set()
 
     def inspect(self, value: object) -> tuple[JsonIssue, ...]:
-        self._visit(value, "$", 0)
+        self._visit(value, "$", "", 0)
         return tuple(self.issues)
 
     def _add(
         self,
         *,
         path: str,
+        json_pointer: str | None,
         kind: str,
         value: object,
         message: str,
@@ -86,15 +114,23 @@ class _Inspector:
                 message=message,
                 suggestion=suggestion,
                 value_repr=_safe_repr(value),
+                json_pointer=json_pointer,
             )
         )
 
-    def _visit(self, value: object, path: str, depth: int) -> None:
+    def _visit(
+        self,
+        value: object,
+        path: str,
+        json_pointer: str | None,
+        depth: int,
+    ) -> None:
         if len(self.issues) >= self.max_issues:
             return
         if depth > self.max_depth:
             self._add(
                 path=path,
+                json_pointer=json_pointer,
                 kind="maximum_depth",
                 value=value,
                 message=f"Diagnostic traversal exceeded max_depth={self.max_depth}.",
@@ -108,6 +144,7 @@ class _Inspector:
             if not self.allow_nan and not math.isfinite(value):
                 self._add(
                     path=path,
+                    json_pointer=json_pointer,
                     kind="non_finite_float",
                     value=value,
                     message="Non-finite floats are forbidden when allow_nan=False.",
@@ -118,18 +155,19 @@ class _Inspector:
                 )
             return
         if isinstance(value, dict):
-            self._visit_container(value, path, depth, is_dict=True)
+            self._visit_container(value, path, json_pointer, depth, is_dict=True)
             return
         if isinstance(value, (list, tuple)):
-            self._visit_container(value, path, depth, is_dict=False)
+            self._visit_container(value, path, json_pointer, depth, is_dict=False)
             return
 
-        self._visit_unsupported(value, path, depth)
+        self._visit_unsupported(value, path, json_pointer, depth)
 
     def _visit_container(
         self,
         value: dict[object, object] | list[object] | tuple[object, ...],
         path: str,
+        json_pointer: str | None,
         depth: int,
         *,
         is_dict: bool,
@@ -138,6 +176,7 @@ class _Inspector:
         if identity in self.ancestors:
             self._add(
                 path=path,
+                json_pointer=json_pointer,
                 kind="circular_reference",
                 value=value,
                 message="This container creates a circular reference.",
@@ -151,14 +190,26 @@ class _Inspector:
         self.ancestors.add(identity)
         try:
             if is_dict:
-                self._visit_dict(cast(dict[object, object], value), path, depth)
+                self._visit_dict(
+                    cast(dict[object, object], value), path, json_pointer, depth
+                )
             elif isinstance(value, list):
                 for index, item in enumerate(list.__iter__(value)):
-                    self._visit(item, f"{path}[{index}]", depth + 1)
+                    self._visit(
+                        item,
+                        f"{path}[{index}]",
+                        _pointer_child(json_pointer, str(index)),
+                        depth + 1,
+                    )
             else:
                 tuple_value = cast(tuple[object, ...], value)
                 for index, item in enumerate(tuple.__iter__(tuple_value)):
-                    self._visit(item, f"{path}[{index}]", depth + 1)
+                    self._visit(
+                        item,
+                        f"{path}[{index}]",
+                        _pointer_child(json_pointer, str(index)),
+                        depth + 1,
+                    )
         finally:
             self.ancestors.remove(identity)
 
@@ -166,16 +217,19 @@ class _Inspector:
         self,
         value: dict[object, object],
         path: str,
+        json_pointer: str | None,
         depth: int,
     ) -> None:
         for key, item in dict.items(value):
             item_path = _path_for_key(path, key)
+            item_pointer = _pointer_child(json_pointer, _pointer_token(key))
             valid_key = key is None or isinstance(key, (str, int, float, bool))
             if not valid_key:
                 if self.skipkeys:
                     continue
                 self._add(
                     path=item_path,
+                    json_pointer=item_pointer,
                     kind="unsupported_key",
                     value=key,
                     message="JSON object keys must be str, int, float, bool, or None.",
@@ -188,17 +242,25 @@ class _Inspector:
             ):
                 self._add(
                     path=item_path,
+                    json_pointer=item_pointer,
                     kind="non_finite_float_key",
                     value=key,
                     message="A non-finite float key is forbidden when allow_nan=False.",
                     suggestion="Replace the key with a finite number or string.",
                 )
-            self._visit(item, item_path, depth + 1)
+            self._visit(item, item_path, item_pointer, depth + 1)
 
-    def _visit_unsupported(self, value: object, path: str, depth: int) -> None:
+    def _visit_unsupported(
+        self,
+        value: object,
+        path: str,
+        json_pointer: str | None,
+        depth: int,
+    ) -> None:
         if self.default is None:
             self._add(
                 path=path,
+                json_pointer=json_pointer,
                 kind="unsupported_type",
                 value=value,
                 message=(
@@ -212,6 +274,7 @@ class _Inspector:
         if identity in self.ancestors:
             self._add(
                 path=path,
+                json_pointer=json_pointer,
                 kind="circular_reference",
                 value=value,
                 message="The default encoder produced a circular reference.",
@@ -228,6 +291,7 @@ class _Inspector:
             except Exception as exc:
                 self._add(
                     path=path,
+                    json_pointer=json_pointer,
                     kind="default_handler_failed",
                     value=value,
                     message=(
@@ -240,6 +304,7 @@ class _Inspector:
             if replacement is value:
                 self._add(
                     path=path,
+                    json_pointer=json_pointer,
                     kind="default_handler_cycle",
                     value=value,
                     message=(
@@ -250,7 +315,7 @@ class _Inspector:
                     ),
                 )
                 return
-            self._visit(replacement, path, depth + 1)
+            self._visit(replacement, path, json_pointer, depth + 1)
         finally:
             self.ancestors.remove(identity)
 
@@ -290,6 +355,7 @@ def diagnose(
     except RecursionError:
         inspector._add(
             path="$",
+            json_pointer="",
             kind="diagnostic_recursion_limit",
             value=value,
             message="Diagnostic traversal reached Python's recursion limit.",

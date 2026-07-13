@@ -53,6 +53,7 @@ def assert_serializable(value: object, **options: Any) -> None:
 def _fallback_issue(value: object, original: BaseException) -> JsonIssue:
     return JsonIssue(
         path="$",
+        json_pointer="",
         kind="serialization_error",
         value_type=qualified_type_name(value),
         message=_exception_message(original),
