@@ -11,6 +11,20 @@ from collections.abc import Sequence
 from . import __version__, explain
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jsonwhy",
@@ -31,6 +45,24 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="json_output",
         help="Emit machine-readable diagnostic JSON.",
+    )
+    parser.add_argument(
+        "--path-style",
+        choices=("jsonpath", "pointer"),
+        default="jsonpath",
+        help="Location style for text output (default: jsonpath).",
+    )
+    parser.add_argument(
+        "--max-issues",
+        type=_positive_int,
+        default=100,
+        help="Maximum number of issues to report (default: 100).",
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=_non_negative_int,
+        default=1000,
+        help="Maximum diagnostic traversal depth (default: 1000).",
     )
     parser.add_argument("--version", action="version", version=__version__)
     return parser
@@ -53,12 +85,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"jsonwhy: invalid Python literal: {exc}", file=sys.stderr)
         return 2
 
-    issues = explain(value, allow_nan=not args.strict)
+    issues = explain(
+        value,
+        allow_nan=not args.strict,
+        max_issues=args.max_issues,
+        max_depth=args.max_depth,
+    )
     if args.json_output:
         print(json.dumps([issue.as_dict() for issue in issues], indent=2))
     elif issues:
         for issue in issues:
-            print(f"{issue.path}: {issue.message}")
+            if args.path_style == "pointer":
+                location = issue.json_pointer
+                if location == "":
+                    location = "<root>"
+                elif location is None:
+                    location = "<no JSON Pointer>"
+            else:
+                location = issue.path
+            print(f"{location}: {issue.message}")
             if issue.suggestion:
                 print(f"  Fix: {issue.suggestion}")
     else:

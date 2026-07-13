@@ -52,10 +52,16 @@ issues = jsonwhy.explain(payload)
 
 for issue in issues:
     print(issue.path)
+    print(issue.json_pointer)
     print(issue.kind)
     print(issue.suggestion)
     print(issue.as_dict())
 ```
+
+Each issue includes both a readable JSONPath-like `path` such as
+`$.users[0].joined` and an RFC 6901 `json_pointer` such as
+`/users/0/joined`. A pointer is `None` when the location contains a Python key
+that cannot exist in a JSON object.
 
 Two shorter checks are also available:
 
@@ -91,6 +97,8 @@ complex numbers, and tuple keys.
 ```bash
 jsonwhy "{'payload': b'hello', 'tags': {'a', 'b'}}"
 jsonwhy --json "{'payload': b'hello'}"
+jsonwhy --path-style pointer "{'payload': b'hello'}"
+jsonwhy --max-issues 10 --max-depth 200 "{'payload': b'hello'}"
 ```
 
 Exit status `0` means compatible, `1` means issues were found, and `2` means the

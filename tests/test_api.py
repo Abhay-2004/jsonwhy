@@ -74,6 +74,42 @@ class ApiTests(unittest.TestCase):
         issue = jsonwhy.explain({"user name": {"a.b": object()}})[0]
         self.assertEqual(issue.path, '$["user name"]["a.b"]')
 
+    def test_json_pointer_escapes_nested_keys(self) -> None:
+        issue = jsonwhy.explain({"a/b": [{"~key": object()}]})[0]
+        self.assertEqual(issue.json_pointer, "/a~1b/0/~0key")
+
+    def test_root_json_pointer_is_empty(self) -> None:
+        issue = jsonwhy.explain(object())[0]
+        self.assertEqual(issue.path, "$")
+        self.assertEqual(issue.json_pointer, "")
+
+    def test_valid_non_string_keys_have_json_pointers(self) -> None:
+        class LabeledInt(int):
+            def __str__(self) -> str:
+                return "label"
+
+            def __repr__(self) -> str:
+                return "labeled-int"
+
+        class LabeledFloat(float):
+            def __repr__(self) -> str:
+                return "labeled-float"
+
+        values_and_pointers = [
+            ({None: object()}, "/null"),
+            ({False: object()}, "/false"),
+            ({2: object()}, "/2"),
+            ({1.5: object()}, "/1.5"),
+            ({math.nan: object()}, "/NaN"),
+            ({math.inf: object()}, "/Infinity"),
+            ({-math.inf: object()}, "/-Infinity"),
+            ({LabeledInt(3): object()}, "/3"),
+            ({LabeledFloat(2.5): object()}, "/2.5"),
+        ]
+        for value, pointer in values_and_pointers:
+            with self.subTest(pointer=pointer):
+                self.assertEqual(jsonwhy.explain(value)[0].json_pointer, pointer)
+
     def test_valid_non_string_key_paths(self) -> None:
         issues = jsonwhy.explain(
             {None: object(), False: object(), 2: object(), 1.5: object()}
@@ -88,6 +124,15 @@ class ApiTests(unittest.TestCase):
         issue = jsonwhy.explain({key: "value"})[0]
         self.assertEqual(issue.kind, "unsupported_key")
         self.assertIn("<key", issue.path)
+        self.assertIsNone(issue.json_pointer)
+
+        issues = jsonwhy.explain({key: object()})
+        self.assertEqual(len(issues), 2)
+        self.assertTrue(all(item.json_pointer is None for item in issues))
+
+    def test_tuple_items_have_json_pointers(self) -> None:
+        issue = jsonwhy.explain(("ok", object()))[0]
+        self.assertEqual(issue.json_pointer, "/1")
 
     def test_skipkeys_matches_json_behavior(self) -> None:
         value = {("bad",): object(), "good": 1}
@@ -282,6 +327,7 @@ class ApiTests(unittest.TestCase):
         issue = jsonwhy.explain({"bad": object()})[0]
         encoded = json.dumps(issue.as_dict())
         self.assertIn('"path": "$.bad"', encoded)
+        self.assertIn('"json_pointer": "/bad"', encoded)
 
     def test_error_can_format_issue_without_suggestion(self) -> None:
         issue = JsonIssue(
