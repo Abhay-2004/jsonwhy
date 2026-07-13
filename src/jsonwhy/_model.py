@@ -16,7 +16,7 @@ class JsonIssue:
         value_type: The fully-qualified Python type name.
         message: A concise explanation for humans.
         suggestion: A likely fix, when one can be offered safely.
-        value_repr: A bounded, best-effort representation of the value.
+        value_repr: A bounded, best-effort representation, or ``<redacted>``.
         json_pointer: The RFC 6901 location, or ``None`` when the location
             cannot exist in a JSON document.
     """

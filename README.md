@@ -70,6 +70,24 @@ jsonwhy.check(payload)                 # bool
 jsonwhy.assert_serializable(payload)   # raises JsonWhyError
 ```
 
+Value representations are useful during development but may not belong in
+production logs. They can be removed without calling `repr()` on the values:
+
+```python
+issues = jsonwhy.explain(payload, include_value_repr=False)
+
+jsonwhy.dumps(
+    payload,
+    diagnostic_include_value_repr=False,
+    diagnostic_max_issues=20,
+    diagnostic_max_depth=200,
+)
+```
+
+The diagnostic options do not change encoded output. Setting
+`include_value_repr=False` controls `value_repr` only; paths, custom suggestion
+text, and exception messages may still contain application data.
+
 `jsonwhy` detects unsupported values and keys, circular references, non-finite
 floats when `allow_nan=False`, failures in custom default handlers, and overly
 deep structures.
@@ -99,6 +117,7 @@ jsonwhy "{'payload': b'hello', 'tags': {'a', 'b'}}"
 jsonwhy --json "{'payload': b'hello'}"
 jsonwhy --path-style pointer "{'payload': b'hello'}"
 jsonwhy --max-issues 10 --max-depth 200 "{'payload': b'hello'}"
+jsonwhy --json --redact-values "{'payload': b'hello'}"
 ```
 
 Exit status `0` means compatible, `1` means issues were found, and `2` means the

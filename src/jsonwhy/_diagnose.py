@@ -29,7 +29,12 @@ def _safe_repr(value: object) -> str:
         return f"<{qualified_type_name(value)} instance; repr() failed>"
 
 
-def _path_for_key(parent: str, key: object) -> str:
+def _path_for_key(
+    parent: str,
+    key: object,
+    *,
+    include_value_repr: bool,
+) -> str:
     if isinstance(key, str):
         if key.isidentifier():
             return f"{parent}.{key}"
@@ -38,8 +43,12 @@ def _path_for_key(parent: str, key: object) -> str:
         return f"{parent}[null]"
     if isinstance(key, bool):
         return f"{parent}[{str(key).lower()}]"
-    if isinstance(key, (int, float)):
-        return f"{parent}[{key!r}]"
+    if isinstance(key, int):
+        return f"{parent}[{int.__repr__(key)}]"
+    if isinstance(key, float):
+        return f"{parent}[{float.__repr__(key)}]"
+    if not include_value_repr:
+        return f"{parent}[<unsupported key>]"
     return f"{parent}[<key {_safe_repr(key)}>]"
 
 
@@ -80,6 +89,7 @@ class _Inspector:
         default: DefaultHandler | None,
         max_issues: int,
         max_depth: int,
+        include_value_repr: bool,
     ) -> None:
         self.skipkeys = skipkeys
         self.allow_nan = allow_nan
@@ -87,6 +97,7 @@ class _Inspector:
         self.default = default
         self.max_issues = max_issues
         self.max_depth = max_depth
+        self.include_value_repr = include_value_repr
         self.issues: list[JsonIssue] = []
         self.ancestors: set[int] = set()
 
@@ -113,7 +124,9 @@ class _Inspector:
                 value_type=qualified_type_name(value),
                 message=message,
                 suggestion=suggestion,
-                value_repr=_safe_repr(value),
+                value_repr=(
+                    _safe_repr(value) if self.include_value_repr else "<redacted>"
+                ),
                 json_pointer=json_pointer,
             )
         )
@@ -221,7 +234,11 @@ class _Inspector:
         depth: int,
     ) -> None:
         for key, item in dict.items(value):
-            item_path = _path_for_key(path, key)
+            item_path = _path_for_key(
+                path,
+                key,
+                include_value_repr=self.include_value_repr,
+            )
             item_pointer = _pointer_child(json_pointer, _pointer_token(key))
             valid_key = key is None or isinstance(key, (str, int, float, bool))
             if not valid_key:
@@ -329,18 +346,18 @@ def diagnose(
     default: DefaultHandler | None = None,
     max_issues: int = 100,
     max_depth: int = 1000,
+    include_value_repr: bool = True,
 ) -> tuple[JsonIssue, ...]:
     """Return all discoverable JSON serialization issues in ``value``.
 
     ``default`` follows the meaning of ``json.dumps(default=...)`` and may be
     called while diagnosing unsupported values. ``check_circular`` is accepted
     for API parity; diagnostics always detect cycles to keep traversal safe.
+    Set ``include_value_repr=False`` to avoid calling ``repr()`` for issue
+    values.
     """
 
-    if max_issues < 1:
-        raise ValueError("max_issues must be at least 1")
-    if max_depth < 0:
-        raise ValueError("max_depth must be non-negative")
+    _validate_limits(max_issues, max_depth)
 
     inspector = _Inspector(
         skipkeys=skipkeys,
@@ -349,6 +366,7 @@ def diagnose(
         default=default,
         max_issues=max_issues,
         max_depth=max_depth,
+        include_value_repr=include_value_repr,
     )
     try:
         return inspector.inspect(value)
@@ -364,3 +382,10 @@ def diagnose(
             ),
         )
         return tuple(inspector.issues)
+
+
+def _validate_limits(max_issues: int, max_depth: int) -> None:
+    if max_issues < 1:
+        raise ValueError("max_issues must be at least 1")
+    if max_depth < 0:
+        raise ValueError("max_depth must be non-negative")
