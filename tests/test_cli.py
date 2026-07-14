@@ -59,6 +59,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("max_depth=0", output.getvalue())
 
+    def test_json_output_can_redact_values(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(["--json", "--redact-values", "{'token': b'secret'}"])
+        self.assertEqual(result, 1)
+        issues = json.loads(output.getvalue())
+        self.assertEqual(issues[0]["value_repr"], "<redacted>")
+        self.assertNotIn("secret", output.getvalue())
+
     def test_invalid_cli_diagnostic_limits(self) -> None:
         for option, value in (("--max-issues", "0"), ("--max-depth", "-1")):
             with self.subTest(option=option):

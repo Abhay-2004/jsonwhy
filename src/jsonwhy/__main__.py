@@ -64,6 +64,11 @@ def _parser() -> argparse.ArgumentParser:
         default=1000,
         help="Maximum diagnostic traversal depth (default: 1000).",
     )
+    parser.add_argument(
+        "--redact-values",
+        action="store_true",
+        help="Replace each issue's value_repr with <redacted>.",
+    )
     parser.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -90,6 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_nan=not args.strict,
         max_issues=args.max_issues,
         max_depth=args.max_depth,
+        include_value_repr=not args.redact_values,
     )
     if args.json_output:
         print(json.dumps([issue.as_dict() for issue in issues], indent=2))

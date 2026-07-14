@@ -34,6 +34,18 @@ class ApiTests(unittest.TestCase):
             jsonwhy.dump({"bad": object()}, stream)
         self.assertEqual(caught.exception.issues[0].path, "$.bad")
 
+    def test_dump_accepts_diagnostic_controls(self) -> None:
+        stream = io.StringIO()
+        with self.assertRaises(jsonwhy.JsonWhyError) as caught:
+            jsonwhy.dump(
+                [object(), object()],
+                stream,
+                diagnostic_max_issues=1,
+                diagnostic_include_value_repr=False,
+            )
+        self.assertEqual(len(caught.exception.issues), 1)
+        self.assertEqual(caught.exception.issues[0].value_repr, "<redacted>")
+
     def test_explain_finds_multiple_nested_issues(self) -> None:
         value = {
             "users": [{"joined": dt.datetime(2026, 7, 12)}],
@@ -240,6 +252,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(caught.exception.issues[0].kind, "serialization_error")
         self.assertIsInstance(caught.exception.original, TypeError)
 
+        with patch(
+            "jsonwhy._api.explain", side_effect=RuntimeError("diagnosis failed")
+        ):
+            with self.assertRaises(jsonwhy.JsonWhyError) as redacted:
+                jsonwhy.dumps(object(), diagnostic_include_value_repr=False)
+        self.assertEqual(redacted.exception.issues[0].value_repr, "<redacted>")
+
     def test_overridden_container_iteration_does_not_mask_original(self) -> None:
         class HostileDict(dict[str, object]):
             calls = 0
@@ -291,11 +310,54 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(issue.kind, "maximum_depth")
         self.assertEqual(issue.path, "$[0][0]")
 
+    def test_dumps_accepts_diagnostic_controls(self) -> None:
+        self.assertEqual(
+            jsonwhy.dumps(
+                {"ok": True},
+                diagnostic_max_issues=1,
+                diagnostic_max_depth=0,
+                diagnostic_include_value_repr=False,
+            ),
+            '{"ok": true}',
+        )
+        with self.assertRaises(jsonwhy.JsonWhyError) as caught:
+            jsonwhy.dumps(
+                [object(), object()],
+                diagnostic_max_issues=1,
+                diagnostic_max_depth=10,
+                diagnostic_include_value_repr=False,
+            )
+        self.assertEqual(len(caught.exception.issues), 1)
+        self.assertEqual(caught.exception.issues[0].value_repr, "<redacted>")
+        self.assertIn("<redacted>", str(caught.exception))
+
     def test_invalid_limits_raise(self) -> None:
         with self.assertRaises(ValueError):
             jsonwhy.explain({}, max_issues=0)
         with self.assertRaises(ValueError):
             jsonwhy.explain({}, max_depth=-1)
+        with self.assertRaises(ValueError):
+            jsonwhy.dumps({}, diagnostic_max_issues=0)
+        with self.assertRaises(ValueError):
+            jsonwhy.dump({}, io.StringIO(), diagnostic_max_depth=-1)
+
+    def test_value_repr_can_be_redacted_without_calling_repr(self) -> None:
+        class SensitiveValue:
+            repr_calls = 0
+
+            def __repr__(self) -> str:
+                self.repr_calls += 1
+                return "secret-token"
+
+        value = SensitiveValue()
+        issue = jsonwhy.explain(value, include_value_repr=False)[0]
+        self.assertEqual(issue.value_repr, "<redacted>")
+        self.assertEqual(value.repr_calls, 0)
+        self.assertNotIn("secret-token", json.dumps(issue.as_dict()))
+
+        issue = jsonwhy.explain({value: "item"}, include_value_repr=False)[0]
+        self.assertEqual(issue.path, "$[<unsupported key>]")
+        self.assertEqual(value.repr_calls, 0)
 
     def test_interpreter_recursion_limit_becomes_an_issue(self) -> None:
         value: list[object] = []

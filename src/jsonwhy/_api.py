@@ -6,7 +6,7 @@ import json as _json
 from collections.abc import Callable
 from typing import IO, Any, NoReturn
 
-from ._diagnose import diagnose
+from ._diagnose import _validate_limits, diagnose
 from ._errors import JsonWhyError, _exception_message
 from ._model import JsonIssue, qualified_type_name
 
@@ -22,8 +22,13 @@ def explain(
     default: Callable[[object], object] | None = None,
     max_issues: int = 100,
     max_depth: int = 1000,
+    include_value_repr: bool = True,
 ) -> tuple[JsonIssue, ...]:
-    """Return structured explanations without raising ``JsonWhyError``."""
+    """Return structured explanations without raising ``JsonWhyError``.
+
+    Set ``include_value_repr=False`` to replace each issue's ``value_repr``
+    with ``<redacted>`` without calling ``repr()`` on that value.
+    """
 
     return diagnose(
         value,
@@ -33,6 +38,7 @@ def explain(
         default=default,
         max_issues=max_issues,
         max_depth=max_depth,
+        include_value_repr=include_value_repr,
     )
 
 
@@ -50,7 +56,12 @@ def assert_serializable(value: object, **options: Any) -> None:
         raise JsonWhyError(issues)
 
 
-def _fallback_issue(value: object, original: BaseException) -> JsonIssue:
+def _fallback_issue(
+    value: object,
+    original: BaseException,
+    *,
+    include_value_repr: bool,
+) -> JsonIssue:
     return JsonIssue(
         path="$",
         json_pointer="",
@@ -60,7 +71,9 @@ def _fallback_issue(value: object, original: BaseException) -> JsonIssue:
         suggestion=(
             "Inspect custom encoder options or reduce this to a smaller reproduction."
         ),
-        value_repr=f"<{qualified_type_name(value)}>",
+        value_repr=(
+            f"<{qualified_type_name(value)}>" if include_value_repr else "<redacted>"
+        ),
     )
 
 
@@ -72,6 +85,9 @@ def _raise_diagnostic(
     allow_nan: bool,
     check_circular: bool,
     default: Callable[[object], object] | None,
+    max_issues: int,
+    max_depth: int,
+    include_value_repr: bool,
 ) -> NoReturn:
     try:
         issues = explain(
@@ -80,11 +96,20 @@ def _raise_diagnostic(
             allow_nan=allow_nan,
             check_circular=check_circular,
             default=default,
+            max_issues=max_issues,
+            max_depth=max_depth,
+            include_value_repr=include_value_repr,
         )
     except Exception:
         issues = ()
     if not issues:
-        issues = (_fallback_issue(value, original),)
+        issues = (
+            _fallback_issue(
+                value,
+                original,
+                include_value_repr=include_value_repr,
+            ),
+        )
     raise JsonWhyError(issues, original=original) from original
 
 
@@ -134,10 +159,14 @@ def dumps(
     separators: tuple[str, str] | None = None,
     default: Callable[[object], object] | None = None,
     sort_keys: bool = False,
+    diagnostic_max_issues: int = 100,
+    diagnostic_max_depth: int = 1000,
+    diagnostic_include_value_repr: bool = True,
     **kw: Any,
 ) -> str:
     """Serialize like ``json.dumps``, but explain failures with exact paths."""
 
+    _validate_limits(diagnostic_max_issues, diagnostic_max_depth)
     try:
         return _json.dumps(
             obj,
@@ -172,6 +201,9 @@ def dumps(
             allow_nan=allow_nan,
             check_circular=check_circular,
             default=diagnostic_default,
+            max_issues=diagnostic_max_issues,
+            max_depth=diagnostic_max_depth,
+            include_value_repr=diagnostic_include_value_repr,
         )
 
 
@@ -188,10 +220,14 @@ def dump(
     separators: tuple[str, str] | None = None,
     default: Callable[[object], object] | None = None,
     sort_keys: bool = False,
+    diagnostic_max_issues: int = 100,
+    diagnostic_max_depth: int = 1000,
+    diagnostic_include_value_repr: bool = True,
     **kw: Any,
 ) -> None:
     """Serialize like ``json.dump``, but explain failures with exact paths."""
 
+    _validate_limits(diagnostic_max_issues, diagnostic_max_depth)
     try:
         _json.dump(
             obj,
@@ -227,4 +263,7 @@ def dump(
             allow_nan=allow_nan,
             check_circular=check_circular,
             default=diagnostic_default,
+            max_issues=diagnostic_max_issues,
+            max_depth=diagnostic_max_depth,
+            include_value_repr=diagnostic_include_value_repr,
         )
