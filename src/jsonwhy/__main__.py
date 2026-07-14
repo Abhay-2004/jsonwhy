@@ -8,7 +8,7 @@ import json
 import sys
 from collections.abc import Sequence
 
-from . import __version__, explain
+from . import __version__, inspect
 
 
 def _positive_int(value: str) -> int:
@@ -40,11 +40,17 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Reject NaN and infinity, matching allow_nan=False.",
     )
-    parser.add_argument(
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument(
         "--json",
         action="store_true",
         dest="json_output",
         help="Emit machine-readable diagnostic JSON.",
+    )
+    output.add_argument(
+        "--json-report",
+        action="store_true",
+        help="Emit a JSON report with traversal metadata.",
     )
     parser.add_argument(
         "--path-style",
@@ -63,6 +69,12 @@ def _parser() -> argparse.ArgumentParser:
         type=_non_negative_int,
         default=1000,
         help="Maximum diagnostic traversal depth (default: 1000).",
+    )
+    parser.add_argument(
+        "--max-nodes",
+        type=_positive_int,
+        default=None,
+        help="Maximum number of values to inspect (default: unlimited).",
     )
     parser.add_argument(
         "--redact-values",
@@ -90,17 +102,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"jsonwhy: invalid Python literal: {exc}", file=sys.stderr)
         return 2
 
-    issues = explain(
+    report = inspect(
         value,
         allow_nan=not args.strict,
         max_issues=args.max_issues,
         max_depth=args.max_depth,
+        max_nodes=args.max_nodes,
         include_value_repr=not args.redact_values,
     )
     if args.json_output:
-        print(json.dumps([issue.as_dict() for issue in issues], indent=2))
-    elif issues:
-        for issue in issues:
+        print(json.dumps([issue.as_dict() for issue in report.issues], indent=2))
+    elif args.json_report:
+        print(json.dumps(report.as_dict(), indent=2))
+    elif report.issues:
+        for issue in report.issues:
             if args.path_style == "pointer":
                 location = issue.json_pointer
                 if location == "":
@@ -112,9 +127,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"{location}: {issue.message}")
             if issue.suggestion:
                 print(f"  Fix: {issue.suggestion}")
+        if report.truncated:
+            reasons = ", ".join(report.truncation_reasons)
+            print(f"Diagnostic traversal was truncated: {reasons}.")
     else:
         print("No JSON serialization issues found.")
-    return 1 if issues else 0
+    return 0 if report.ok else 1
 
 
 if __name__ == "__main__":

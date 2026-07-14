@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json as _json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import IO, Any, NoReturn
 
-from ._diagnose import _validate_limits, diagnose
+from ._diagnose import (
+    _validate_limits,
+    diagnose,
+    inspect_diagnostics,
+    iter_diagnostics,
+)
 from ._errors import JsonWhyError, _exception_message
-from ._model import JsonIssue, qualified_type_name
+from ._model import JsonIssue, JsonReport, qualified_type_name
 
 _SERIALIZATION_ERRORS = (TypeError, ValueError, OverflowError, RecursionError)
 
@@ -22,6 +27,7 @@ def explain(
     default: Callable[[object], object] | None = None,
     max_issues: int = 100,
     max_depth: int = 1000,
+    max_nodes: int | None = None,
     include_value_repr: bool = True,
 ) -> tuple[JsonIssue, ...]:
     """Return structured explanations without raising ``JsonWhyError``.
@@ -38,6 +44,61 @@ def explain(
         default=default,
         max_issues=max_issues,
         max_depth=max_depth,
+        max_nodes=max_nodes,
+        include_value_repr=include_value_repr,
+    )
+
+
+def iter_issues(
+    value: object,
+    *,
+    skipkeys: bool = False,
+    allow_nan: bool = True,
+    check_circular: bool = True,
+    default: Callable[[object], object] | None = None,
+    max_issues: int = 100,
+    max_depth: int = 1000,
+    max_nodes: int | None = None,
+    include_value_repr: bool = True,
+) -> Iterator[JsonIssue]:
+    """Yield structured explanations as they are discovered."""
+
+    return iter_diagnostics(
+        value,
+        skipkeys=skipkeys,
+        allow_nan=allow_nan,
+        check_circular=check_circular,
+        default=default,
+        max_issues=max_issues,
+        max_depth=max_depth,
+        max_nodes=max_nodes,
+        include_value_repr=include_value_repr,
+    )
+
+
+def inspect(
+    value: object,
+    *,
+    skipkeys: bool = False,
+    allow_nan: bool = True,
+    check_circular: bool = True,
+    default: Callable[[object], object] | None = None,
+    max_issues: int = 100,
+    max_depth: int = 1000,
+    max_nodes: int | None = None,
+    include_value_repr: bool = True,
+) -> JsonReport:
+    """Return a structured report for a JSON compatibility inspection."""
+
+    return inspect_diagnostics(
+        value,
+        skipkeys=skipkeys,
+        allow_nan=allow_nan,
+        check_circular=check_circular,
+        default=default,
+        max_issues=max_issues,
+        max_depth=max_depth,
+        max_nodes=max_nodes,
         include_value_repr=include_value_repr,
     )
 
@@ -45,15 +106,15 @@ def explain(
 def check(value: object, **options: Any) -> bool:
     """Return ``True`` when no JSON compatibility issues are found."""
 
-    return not explain(value, **options)
+    return inspect(value, **options).ok
 
 
 def assert_serializable(value: object, **options: Any) -> None:
     """Raise ``JsonWhyError`` if ``value`` is not JSON serializable."""
 
-    issues = explain(value, **options)
-    if issues:
-        raise JsonWhyError(issues)
+    report = inspect(value, **options)
+    if not report.ok:
+        raise JsonWhyError(report.issues, report=report)
 
 
 def _fallback_issue(
@@ -65,6 +126,7 @@ def _fallback_issue(
     return JsonIssue(
         path="$",
         json_pointer="",
+        path_segments=(),
         kind="serialization_error",
         value_type=qualified_type_name(value),
         message=_exception_message(original),
@@ -87,10 +149,11 @@ def _raise_diagnostic(
     default: Callable[[object], object] | None,
     max_issues: int,
     max_depth: int,
+    max_nodes: int | None,
     include_value_repr: bool,
 ) -> NoReturn:
     try:
-        issues = explain(
+        report = inspect(
             value,
             skipkeys=skipkeys,
             allow_nan=allow_nan,
@@ -98,11 +161,12 @@ def _raise_diagnostic(
             default=default,
             max_issues=max_issues,
             max_depth=max_depth,
+            max_nodes=max_nodes,
             include_value_repr=include_value_repr,
         )
     except Exception:
-        issues = ()
-    if not issues:
+        report = JsonReport((), nodes_visited=0)
+    if not report.issues:
         issues = (
             _fallback_issue(
                 value,
@@ -110,7 +174,8 @@ def _raise_diagnostic(
                 include_value_repr=include_value_repr,
             ),
         )
-    raise JsonWhyError(issues, original=original) from original
+        report = JsonReport(issues, nodes_visited=report.nodes_visited)
+    raise JsonWhyError(report.issues, original=original, report=report) from original
 
 
 def _custom_encoder_default(
@@ -161,12 +226,17 @@ def dumps(
     sort_keys: bool = False,
     diagnostic_max_issues: int = 100,
     diagnostic_max_depth: int = 1000,
+    diagnostic_max_nodes: int | None = None,
     diagnostic_include_value_repr: bool = True,
     **kw: Any,
 ) -> str:
     """Serialize like ``json.dumps``, but explain failures with exact paths."""
 
-    _validate_limits(diagnostic_max_issues, diagnostic_max_depth)
+    _validate_limits(
+        diagnostic_max_issues,
+        diagnostic_max_depth,
+        diagnostic_max_nodes,
+    )
     try:
         return _json.dumps(
             obj,
@@ -203,6 +273,7 @@ def dumps(
             default=diagnostic_default,
             max_issues=diagnostic_max_issues,
             max_depth=diagnostic_max_depth,
+            max_nodes=diagnostic_max_nodes,
             include_value_repr=diagnostic_include_value_repr,
         )
 
@@ -222,12 +293,17 @@ def dump(
     sort_keys: bool = False,
     diagnostic_max_issues: int = 100,
     diagnostic_max_depth: int = 1000,
+    diagnostic_max_nodes: int | None = None,
     diagnostic_include_value_repr: bool = True,
     **kw: Any,
 ) -> None:
     """Serialize like ``json.dump``, but explain failures with exact paths."""
 
-    _validate_limits(diagnostic_max_issues, diagnostic_max_depth)
+    _validate_limits(
+        diagnostic_max_issues,
+        diagnostic_max_depth,
+        diagnostic_max_nodes,
+    )
     try:
         _json.dump(
             obj,
@@ -265,5 +341,6 @@ def dump(
             default=diagnostic_default,
             max_issues=diagnostic_max_issues,
             max_depth=diagnostic_max_depth,
+            max_nodes=diagnostic_max_nodes,
             include_value_repr=diagnostic_include_value_repr,
         )
