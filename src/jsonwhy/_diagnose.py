@@ -1,15 +1,16 @@
-"""Recursive JSON compatibility diagnostics."""
+"""JSON compatibility diagnostics."""
 
 from __future__ import annotations
 
 import json
 import math
 import reprlib
-from collections.abc import Callable
-from typing import cast
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from typing import TypeAlias
 
 from ._errors import _exception_message, _exception_type_name
-from ._model import JsonIssue, qualified_type_name
+from ._model import JsonIssue, JsonReport, PathSegment, qualified_type_name
 from ._registry import suggestion_for
 
 DefaultHandler = Callable[[object], object]
@@ -79,6 +80,51 @@ def _pointer_child(parent: str | None, token: str | None) -> str | None:
     return f"{parent}/{escaped}"
 
 
+def _segments_child(
+    parent: tuple[PathSegment, ...] | None,
+    segment: PathSegment | None,
+) -> tuple[PathSegment, ...] | None:
+    if parent is None or segment is None:
+        return None
+    return (*parent, segment)
+
+
+@dataclass(slots=True)
+class _VisitFrame:
+    value: object
+    path: str
+    json_pointer: str | None
+    path_segments: tuple[PathSegment, ...] | None
+    depth: int
+
+
+@dataclass(slots=True)
+class _LeaveFrame:
+    identity: int
+
+
+@dataclass(slots=True)
+class _SequenceFrame:
+    iterator: Iterator[object]
+    path: str
+    json_pointer: str | None
+    path_segments: tuple[PathSegment, ...] | None
+    depth: int
+    index: int = 0
+
+
+@dataclass(slots=True)
+class _MappingFrame:
+    iterator: Iterator[tuple[object, object]]
+    path: str
+    json_pointer: str | None
+    path_segments: tuple[PathSegment, ...] | None
+    depth: int
+
+
+_Frame: TypeAlias = _VisitFrame | _LeaveFrame | _SequenceFrame | _MappingFrame
+
+
 class _Inspector:
     def __init__(
         self,
@@ -89,6 +135,7 @@ class _Inspector:
         default: DefaultHandler | None,
         max_issues: int,
         max_depth: int,
+        max_nodes: int | None,
         include_value_repr: bool,
     ) -> None:
         self.skipkeys = skipkeys
@@ -97,218 +144,286 @@ class _Inspector:
         self.default = default
         self.max_issues = max_issues
         self.max_depth = max_depth
+        self.max_nodes = max_nodes
         self.include_value_repr = include_value_repr
-        self.issues: list[JsonIssue] = []
-        self.ancestors: set[int] = set()
+        self.nodes_visited = 0
+        self.truncated = False
+        self.truncation_reasons: list[str] = []
+        self._issues_yielded = 0
+        self._ancestors: set[int] = set()
 
-    def inspect(self, value: object) -> tuple[JsonIssue, ...]:
-        self._visit(value, "$", "", 0)
-        return tuple(self.issues)
+    def _mark_truncated(self, reason: str) -> None:
+        self.truncated = True
+        if reason not in self.truncation_reasons:
+            self.truncation_reasons.append(reason)
 
-    def _add(
+    def _issue(
         self,
         *,
         path: str,
         json_pointer: str | None,
+        path_segments: tuple[PathSegment, ...] | None,
         kind: str,
         value: object,
         message: str,
         suggestion: str | None,
-    ) -> None:
-        if len(self.issues) >= self.max_issues:
-            return
-        self.issues.append(
-            JsonIssue(
-                path=path,
-                kind=kind,
-                value_type=qualified_type_name(value),
-                message=message,
-                suggestion=suggestion,
-                value_repr=(
-                    _safe_repr(value) if self.include_value_repr else "<redacted>"
-                ),
-                json_pointer=json_pointer,
-            )
+    ) -> JsonIssue:
+        self._issues_yielded += 1
+        return JsonIssue(
+            path=path,
+            kind=kind,
+            value_type=qualified_type_name(value),
+            message=message,
+            suggestion=suggestion,
+            value_repr=(_safe_repr(value) if self.include_value_repr else "<redacted>"),
+            json_pointer=json_pointer,
+            path_segments=path_segments,
         )
 
-    def _visit(
-        self,
-        value: object,
-        path: str,
-        json_pointer: str | None,
-        depth: int,
-    ) -> None:
-        if len(self.issues) >= self.max_issues:
-            return
-        if depth > self.max_depth:
-            self._add(
-                path=path,
-                json_pointer=json_pointer,
-                kind="maximum_depth",
-                value=value,
-                message=f"Diagnostic traversal exceeded max_depth={self.max_depth}.",
-                suggestion="Increase max_depth, or flatten the nested structure.",
-            )
-            return
+    def iter_issues(self, value: object) -> Iterator[JsonIssue]:
+        stack: list[_Frame] = [_VisitFrame(value, "$", "", (), 0)]
 
-        if value is None or isinstance(value, (str, int, bool)):
-            return
-        if isinstance(value, float):
-            if not self.allow_nan and not math.isfinite(value):
-                self._add(
-                    path=path,
-                    json_pointer=json_pointer,
-                    kind="non_finite_float",
-                    value=value,
-                    message="Non-finite floats are forbidden when allow_nan=False.",
-                    suggestion=(
-                        "Replace NaN or infinity with None, a string, or a finite "
-                        "number."
-                    ),
-                )
-            return
-        if isinstance(value, dict):
-            self._visit_container(value, path, json_pointer, depth, is_dict=True)
-            return
-        if isinstance(value, (list, tuple)):
-            self._visit_container(value, path, json_pointer, depth, is_dict=False)
-            return
+        while stack:
+            if self._issues_yielded >= self.max_issues:
+                self._mark_truncated("max_issues")
+                return
 
-        self._visit_unsupported(value, path, json_pointer, depth)
+            frame = stack.pop()
+            if isinstance(frame, _LeaveFrame):
+                self._ancestors.remove(frame.identity)
+                continue
 
-    def _visit_container(
-        self,
-        value: dict[object, object] | list[object] | tuple[object, ...],
-        path: str,
-        json_pointer: str | None,
-        depth: int,
-        *,
-        is_dict: bool,
-    ) -> None:
-        identity = id(value)
-        if identity in self.ancestors:
-            self._add(
-                path=path,
-                json_pointer=json_pointer,
-                kind="circular_reference",
-                value=value,
-                message="This container creates a circular reference.",
-                suggestion=(
-                    "Remove the cycle or replace the repeated reference with an "
-                    "identifier."
-                ),
-            )
-            return
-
-        self.ancestors.add(identity)
-        try:
-            if is_dict:
-                self._visit_dict(
-                    cast(dict[object, object], value), path, json_pointer, depth
-                )
-            elif isinstance(value, list):
-                for index, item in enumerate(list.__iter__(value)):
-                    self._visit(
-                        item,
-                        f"{path}[{index}]",
-                        _pointer_child(json_pointer, str(index)),
-                        depth + 1,
-                    )
-            else:
-                tuple_value = cast(tuple[object, ...], value)
-                for index, item in enumerate(tuple.__iter__(tuple_value)):
-                    self._visit(
-                        item,
-                        f"{path}[{index}]",
-                        _pointer_child(json_pointer, str(index)),
-                        depth + 1,
-                    )
-        finally:
-            self.ancestors.remove(identity)
-
-    def _visit_dict(
-        self,
-        value: dict[object, object],
-        path: str,
-        json_pointer: str | None,
-        depth: int,
-    ) -> None:
-        for key, item in dict.items(value):
-            item_path = _path_for_key(
-                path,
-                key,
-                include_value_repr=self.include_value_repr,
-            )
-            item_pointer = _pointer_child(json_pointer, _pointer_token(key))
-            valid_key = key is None or isinstance(key, (str, int, float, bool))
-            if not valid_key:
-                if self.skipkeys:
+            if isinstance(frame, _SequenceFrame):
+                try:
+                    item = next(frame.iterator)
+                except StopIteration:
                     continue
-                self._add(
-                    path=item_path,
-                    json_pointer=item_pointer,
-                    kind="unsupported_key",
-                    value=key,
-                    message="JSON object keys must be str, int, float, bool, or None.",
+                index = frame.index
+                frame.index += 1
+                stack.append(frame)
+                stack.append(
+                    _VisitFrame(
+                        item,
+                        f"{frame.path}[{index}]",
+                        _pointer_child(frame.json_pointer, str(index)),
+                        _segments_child(frame.path_segments, index),
+                        frame.depth + 1,
+                    )
+                )
+                continue
+
+            if isinstance(frame, _MappingFrame):
+                try:
+                    key, item = next(frame.iterator)
+                except StopIteration:
+                    continue
+                stack.append(frame)
+                item_path = _path_for_key(
+                    frame.path,
+                    key,
+                    include_value_repr=self.include_value_repr,
+                )
+                token = _pointer_token(key)
+                item_pointer = _pointer_child(frame.json_pointer, token)
+                item_segments = _segments_child(frame.path_segments, token)
+                valid_key = key is None or isinstance(key, (str, int, float, bool))
+                if not valid_key and self.skipkeys:
+                    continue
+                stack.append(
+                    _VisitFrame(
+                        item,
+                        item_path,
+                        item_pointer,
+                        item_segments,
+                        frame.depth + 1,
+                    )
+                )
+                if not valid_key:
+                    yield self._issue(
+                        path=item_path,
+                        json_pointer=item_pointer,
+                        path_segments=item_segments,
+                        kind="unsupported_key",
+                        value=key,
+                        message=(
+                            "JSON object keys must be str, int, float, bool, or None."
+                        ),
+                        suggestion=(
+                            "Convert the key to a string, or use skipkeys=True to "
+                            "omit it."
+                        ),
+                    )
+                elif (
+                    isinstance(key, float)
+                    and not self.allow_nan
+                    and not math.isfinite(key)
+                ):
+                    yield self._issue(
+                        path=item_path,
+                        json_pointer=item_pointer,
+                        path_segments=item_segments,
+                        kind="non_finite_float_key",
+                        value=key,
+                        message=(
+                            "A non-finite float key is forbidden when allow_nan=False."
+                        ),
+                        suggestion="Replace the key with a finite number or string.",
+                    )
+                continue
+
+            if self.max_nodes is not None and self.nodes_visited >= self.max_nodes:
+                self._mark_truncated("max_nodes")
+                stack.clear()
+                yield self._issue(
+                    path=frame.path,
+                    json_pointer=frame.json_pointer,
+                    path_segments=frame.path_segments,
+                    kind="maximum_nodes",
+                    value=frame.value,
+                    message=(
+                        f"Diagnostic traversal reached max_nodes={self.max_nodes}."
+                    ),
+                    suggestion="Increase max_nodes, or inspect a smaller subtree.",
+                )
+                return
+
+            self.nodes_visited += 1
+            if frame.depth > self.max_depth:
+                self._mark_truncated("max_depth")
+                yield self._issue(
+                    path=frame.path,
+                    json_pointer=frame.json_pointer,
+                    path_segments=frame.path_segments,
+                    kind="maximum_depth",
+                    value=frame.value,
+                    message=(
+                        f"Diagnostic traversal exceeded max_depth={self.max_depth}."
+                    ),
+                    suggestion="Increase max_depth, or flatten the nested structure.",
+                )
+                continue
+
+            value = frame.value
+            if value is None or isinstance(value, (str, int, bool)):
+                continue
+            if isinstance(value, float):
+                if not self.allow_nan and not math.isfinite(value):
+                    yield self._issue(
+                        path=frame.path,
+                        json_pointer=frame.json_pointer,
+                        path_segments=frame.path_segments,
+                        kind="non_finite_float",
+                        value=value,
+                        message=(
+                            "Non-finite floats are forbidden when allow_nan=False."
+                        ),
+                        suggestion=(
+                            "Replace NaN or infinity with None, a string, or a finite "
+                            "number."
+                        ),
+                    )
+                continue
+            if isinstance(value, dict):
+                identity = id(value)
+                if identity in self._ancestors:
+                    yield self._issue(
+                        path=frame.path,
+                        json_pointer=frame.json_pointer,
+                        path_segments=frame.path_segments,
+                        kind="circular_reference",
+                        value=value,
+                        message="This container creates a circular reference.",
+                        suggestion=(
+                            "Remove the cycle or replace the repeated reference with "
+                            "an identifier."
+                        ),
+                    )
+                    continue
+                self._ancestors.add(identity)
+                stack.append(_LeaveFrame(identity))
+                stack.append(
+                    _MappingFrame(
+                        iter(dict.items(value)),
+                        frame.path,
+                        frame.json_pointer,
+                        frame.path_segments,
+                        frame.depth,
+                    )
+                )
+                continue
+            if isinstance(value, (list, tuple)):
+                identity = id(value)
+                if identity in self._ancestors:
+                    yield self._issue(
+                        path=frame.path,
+                        json_pointer=frame.json_pointer,
+                        path_segments=frame.path_segments,
+                        kind="circular_reference",
+                        value=value,
+                        message="This container creates a circular reference.",
+                        suggestion=(
+                            "Remove the cycle or replace the repeated reference with "
+                            "an identifier."
+                        ),
+                    )
+                    continue
+                self._ancestors.add(identity)
+                stack.append(_LeaveFrame(identity))
+                iterator = (
+                    list.__iter__(value)
+                    if isinstance(value, list)
+                    else tuple.__iter__(value)
+                )
+                stack.append(
+                    _SequenceFrame(
+                        iterator,
+                        frame.path,
+                        frame.json_pointer,
+                        frame.path_segments,
+                        frame.depth,
+                    )
+                )
+                continue
+
+            if self.default is None:
+                yield self._issue(
+                    path=frame.path,
+                    json_pointer=frame.json_pointer,
+                    path_segments=frame.path_segments,
+                    kind="unsupported_type",
+                    value=value,
+                    message=(
+                        f"Object of type {type(value).__name__} is not JSON "
+                        "serializable."
+                    ),
+                    suggestion=suggestion_for(value),
+                )
+                continue
+
+            identity = id(value)
+            if identity in self._ancestors:
+                yield self._issue(
+                    path=frame.path,
+                    json_pointer=frame.json_pointer,
+                    path_segments=frame.path_segments,
+                    kind="circular_reference",
+                    value=value,
+                    message="The default encoder produced a circular reference.",
                     suggestion=(
-                        "Convert the key to a string, or use skipkeys=True to omit it."
+                        "Return a new JSON-compatible value from the default encoder."
                     ),
                 )
-            elif (
-                isinstance(key, float) and not self.allow_nan and not math.isfinite(key)
-            ):
-                self._add(
-                    path=item_path,
-                    json_pointer=item_pointer,
-                    kind="non_finite_float_key",
-                    value=key,
-                    message="A non-finite float key is forbidden when allow_nan=False.",
-                    suggestion="Replace the key with a finite number or string.",
-                )
-            self._visit(item, item_path, item_pointer, depth + 1)
+                continue
 
-    def _visit_unsupported(
-        self,
-        value: object,
-        path: str,
-        json_pointer: str | None,
-        depth: int,
-    ) -> None:
-        if self.default is None:
-            self._add(
-                path=path,
-                json_pointer=json_pointer,
-                kind="unsupported_type",
-                value=value,
-                message=(
-                    f"Object of type {type(value).__name__} is not JSON serializable."
-                ),
-                suggestion=suggestion_for(value),
-            )
-            return
-
-        identity = id(value)
-        if identity in self.ancestors:
-            self._add(
-                path=path,
-                json_pointer=json_pointer,
-                kind="circular_reference",
-                value=value,
-                message="The default encoder produced a circular reference.",
-                suggestion=(
-                    "Return a new JSON-compatible value from the default encoder."
-                ),
-            )
-            return
-
-        self.ancestors.add(identity)
-        try:
+            self._ancestors.add(identity)
             try:
                 replacement = self.default(value)
             except Exception as exc:
-                self._add(
-                    path=path,
-                    json_pointer=json_pointer,
+                self._ancestors.remove(identity)
+                yield self._issue(
+                    path=frame.path,
+                    json_pointer=frame.json_pointer,
+                    path_segments=frame.path_segments,
                     kind="default_handler_failed",
                     value=value,
                     message=(
@@ -317,11 +432,13 @@ class _Inspector:
                     ),
                     suggestion=suggestion_for(value),
                 )
-                return
+                continue
             if replacement is value:
-                self._add(
-                    path=path,
-                    json_pointer=json_pointer,
+                self._ancestors.remove(identity)
+                yield self._issue(
+                    path=frame.path,
+                    json_pointer=frame.json_pointer,
+                    path_segments=frame.path_segments,
                     kind="default_handler_cycle",
                     value=value,
                     message=(
@@ -331,10 +448,101 @@ class _Inspector:
                         "Return a new JSON-compatible value from the default encoder."
                     ),
                 )
-                return
-            self._visit(replacement, path, json_pointer, depth + 1)
-        finally:
-            self.ancestors.remove(identity)
+                continue
+            stack.append(_LeaveFrame(identity))
+            stack.append(
+                _VisitFrame(
+                    replacement,
+                    frame.path,
+                    frame.json_pointer,
+                    frame.path_segments,
+                    frame.depth + 1,
+                )
+            )
+
+
+def _new_inspector(
+    *,
+    skipkeys: bool,
+    allow_nan: bool,
+    check_circular: bool,
+    default: DefaultHandler | None,
+    max_issues: int,
+    max_depth: int,
+    max_nodes: int | None,
+    include_value_repr: bool,
+) -> _Inspector:
+    _validate_limits(max_issues, max_depth, max_nodes)
+    return _Inspector(
+        skipkeys=skipkeys,
+        allow_nan=allow_nan,
+        check_circular=check_circular,
+        default=default,
+        max_issues=max_issues,
+        max_depth=max_depth,
+        max_nodes=max_nodes,
+        include_value_repr=include_value_repr,
+    )
+
+
+def iter_diagnostics(
+    value: object,
+    *,
+    skipkeys: bool = False,
+    allow_nan: bool = True,
+    check_circular: bool = True,
+    default: DefaultHandler | None = None,
+    max_issues: int = 100,
+    max_depth: int = 1000,
+    max_nodes: int | None = None,
+    include_value_repr: bool = True,
+) -> Iterator[JsonIssue]:
+    """Yield JSON compatibility issues as they are discovered."""
+
+    inspector = _new_inspector(
+        skipkeys=skipkeys,
+        allow_nan=allow_nan,
+        check_circular=check_circular,
+        default=default,
+        max_issues=max_issues,
+        max_depth=max_depth,
+        max_nodes=max_nodes,
+        include_value_repr=include_value_repr,
+    )
+    return inspector.iter_issues(value)
+
+
+def inspect_diagnostics(
+    value: object,
+    *,
+    skipkeys: bool = False,
+    allow_nan: bool = True,
+    check_circular: bool = True,
+    default: DefaultHandler | None = None,
+    max_issues: int = 100,
+    max_depth: int = 1000,
+    max_nodes: int | None = None,
+    include_value_repr: bool = True,
+) -> JsonReport:
+    """Return a structured report for a JSON compatibility inspection."""
+
+    inspector = _new_inspector(
+        skipkeys=skipkeys,
+        allow_nan=allow_nan,
+        check_circular=check_circular,
+        default=default,
+        max_issues=max_issues,
+        max_depth=max_depth,
+        max_nodes=max_nodes,
+        include_value_repr=include_value_repr,
+    )
+    issues = tuple(inspector.iter_issues(value))
+    return JsonReport(
+        issues=issues,
+        nodes_visited=inspector.nodes_visited,
+        truncated=inspector.truncated,
+        truncation_reasons=tuple(inspector.truncation_reasons),
+    )
 
 
 def diagnose(
@@ -346,46 +554,32 @@ def diagnose(
     default: DefaultHandler | None = None,
     max_issues: int = 100,
     max_depth: int = 1000,
+    max_nodes: int | None = None,
     include_value_repr: bool = True,
 ) -> tuple[JsonIssue, ...]:
-    """Return all discoverable JSON serialization issues in ``value``.
+    """Return all discoverable JSON serialization issues in ``value``."""
 
-    ``default`` follows the meaning of ``json.dumps(default=...)`` and may be
-    called while diagnosing unsupported values. ``check_circular`` is accepted
-    for API parity; diagnostics always detect cycles to keep traversal safe.
-    Set ``include_value_repr=False`` to avoid calling ``repr()`` for issue
-    values.
-    """
-
-    _validate_limits(max_issues, max_depth)
-
-    inspector = _Inspector(
+    return inspect_diagnostics(
+        value,
         skipkeys=skipkeys,
         allow_nan=allow_nan,
         check_circular=check_circular,
         default=default,
         max_issues=max_issues,
         max_depth=max_depth,
+        max_nodes=max_nodes,
         include_value_repr=include_value_repr,
-    )
-    try:
-        return inspector.inspect(value)
-    except RecursionError:
-        inspector._add(
-            path="$",
-            json_pointer="",
-            kind="diagnostic_recursion_limit",
-            value=value,
-            message="Diagnostic traversal reached Python's recursion limit.",
-            suggestion=(
-                "Reduce max_depth, flatten the structure, or inspect smaller subtrees."
-            ),
-        )
-        return tuple(inspector.issues)
+    ).issues
 
 
-def _validate_limits(max_issues: int, max_depth: int) -> None:
+def _validate_limits(
+    max_issues: int,
+    max_depth: int,
+    max_nodes: int | None = None,
+) -> None:
     if max_issues < 1:
         raise ValueError("max_issues must be at least 1")
     if max_depth < 0:
         raise ValueError("max_depth must be non-negative")
+    if max_nodes is not None and max_nodes < 1:
+        raise ValueError("max_nodes must be at least 1")

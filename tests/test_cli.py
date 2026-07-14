@@ -59,6 +59,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("max_depth=0", output.getvalue())
 
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(["--max-nodes", "1", "[[1]]"])
+        self.assertEqual(result, 1)
+        self.assertIn("max_nodes=1", output.getvalue())
+        self.assertIn("truncated: max_nodes", output.getvalue())
+
+    def test_json_report_output(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(["--json-report", "{'bad': b'data'}"])
+        self.assertEqual(result, 1)
+        report = json.loads(output.getvalue())
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["truncated"])
+        self.assertEqual(report["nodes_visited"], 2)
+        self.assertEqual(report["issues"][0]["path_segments"], ["bad"])
+
     def test_json_output_can_redact_values(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
@@ -69,13 +87,24 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("secret", output.getvalue())
 
     def test_invalid_cli_diagnostic_limits(self) -> None:
-        for option, value in (("--max-issues", "0"), ("--max-depth", "-1")):
+        invalid_limits = (
+            ("--max-issues", "0"),
+            ("--max-depth", "-1"),
+            ("--max-nodes", "0"),
+        )
+        for option, value in invalid_limits:
             with self.subTest(option=option):
                 errors = io.StringIO()
                 with redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
                     main([option, value, "{}"])
                 self.assertEqual(caught.exception.code, 2)
                 self.assertIn("error:", errors.getvalue())
+
+    def test_json_outputs_are_mutually_exclusive(self) -> None:
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+            main(["--json", "--json-report", "{}"])
+        self.assertEqual(caught.exception.code, 2)
 
     def test_strict_flag_is_accepted(self) -> None:
         output = io.StringIO()

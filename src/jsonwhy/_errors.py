@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from ._model import JsonIssue
+from ._model import JsonIssue, JsonReport
 
 
 def _exception_message(error: BaseException) -> str:
@@ -29,9 +29,13 @@ class JsonWhyError(TypeError):
         issues: Sequence[JsonIssue],
         *,
         original: BaseException | None = None,
+        report: JsonReport | None = None,
     ) -> None:
         self.issues = tuple(issues)
         self.original = original
+        if report is not None and report.issues != self.issues:
+            raise ValueError("report issues must match the supplied issues")
+        self.report = report or JsonReport(self.issues, nodes_visited=0)
         super().__init__(self._format_message())
 
     def _format_message(self) -> str:

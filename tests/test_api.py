@@ -72,6 +72,8 @@ class ApiTests(unittest.TestCase):
         self.assertIsInstance(error, TypeError)
         self.assertIsInstance(error.original, TypeError)
         self.assertEqual(error.issues[0].path, "$.price")
+        self.assertEqual(error.report.issues, error.issues)
+        self.assertGreater(error.report.nodes_visited, 0)
         self.assertIn("preserve precision", str(error))
         self.assertIn("Original error", str(error))
 
@@ -89,6 +91,15 @@ class ApiTests(unittest.TestCase):
     def test_json_pointer_escapes_nested_keys(self) -> None:
         issue = jsonwhy.explain({"a/b": [{"~key": object()}]})[0]
         self.assertEqual(issue.json_pointer, "/a~1b/0/~0key")
+        self.assertEqual(issue.path_segments, ("a/b", 0, "~key"))
+
+    def test_path_segments_distinguish_keys_and_indexes(self) -> None:
+        issue = jsonwhy.explain({2: [object()]})[0]
+        self.assertEqual(issue.path_segments, ("2", 0))
+        self.assertEqual(issue.as_dict()["path_segments"], ["2", 0])
+
+        self.assertEqual(jsonwhy.explain(object())[0].path_segments, ())
+        self.assertIsNone(jsonwhy.explain({("bad",): object()})[0].path_segments)
 
     def test_root_json_pointer_is_empty(self) -> None:
         issue = jsonwhy.explain(object())[0]
@@ -172,6 +183,12 @@ class ApiTests(unittest.TestCase):
         with self.assertRaises(jsonwhy.JsonWhyError):
             jsonwhy.dumps(cyclic)
 
+        cyclic_mapping: dict[str, object] = {}
+        cyclic_mapping["self"] = cyclic_mapping
+        mapping_issue = jsonwhy.explain(cyclic_mapping)[0]
+        self.assertEqual(mapping_issue.kind, "circular_reference")
+        self.assertEqual(mapping_issue.path_segments, ("self",))
+
         shared = [1, 2]
         self.assertTrue(jsonwhy.check({"a": shared, "b": shared}))
 
@@ -245,7 +262,7 @@ class ApiTests(unittest.TestCase):
 
     def test_diagnostic_failure_falls_back_to_original_error(self) -> None:
         with patch(
-            "jsonwhy._api.explain", side_effect=RuntimeError("diagnosis failed")
+            "jsonwhy._api.inspect", side_effect=RuntimeError("diagnosis failed")
         ):
             with self.assertRaises(jsonwhy.JsonWhyError) as caught:
                 jsonwhy.dumps(object())
@@ -253,7 +270,7 @@ class ApiTests(unittest.TestCase):
         self.assertIsInstance(caught.exception.original, TypeError)
 
         with patch(
-            "jsonwhy._api.explain", side_effect=RuntimeError("diagnosis failed")
+            "jsonwhy._api.inspect", side_effect=RuntimeError("diagnosis failed")
         ):
             with self.assertRaises(jsonwhy.JsonWhyError) as redacted:
                 jsonwhy.dumps(object(), diagnostic_include_value_repr=False)
@@ -310,12 +327,62 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(issue.kind, "maximum_depth")
         self.assertEqual(issue.path, "$[0][0]")
 
+    def test_inspect_reports_progress_and_truncation(self) -> None:
+        report = jsonwhy.inspect({"valid": [1], "bad": object()})
+        self.assertFalse(report.ok)
+        self.assertFalse(report.truncated)
+        self.assertEqual(report.nodes_visited, 4)
+        self.assertEqual(report.issues[0].path_segments, ("bad",))
+        encoded_report = json.loads(json.dumps(report.as_dict()))
+        self.assertEqual(encoded_report["issues"][0]["path"], "$.bad")
+
+        valid_report = jsonwhy.inspect({"valid": True})
+        self.assertTrue(valid_report.ok)
+        self.assertFalse(valid_report.truncated)
+
+        issue_report = jsonwhy.inspect([object(), object()], max_issues=1)
+        self.assertTrue(issue_report.truncated)
+        self.assertEqual(issue_report.truncation_reasons, ("max_issues",))
+
+        depth_report = jsonwhy.inspect([[[1]]], max_depth=1)
+        self.assertTrue(depth_report.truncated)
+        self.assertEqual(depth_report.truncation_reasons, ("max_depth",))
+
+        node_report = jsonwhy.inspect({"items": [1, object()]}, max_nodes=2)
+        self.assertEqual(node_report.nodes_visited, 2)
+        self.assertTrue(node_report.truncated)
+        self.assertEqual(node_report.truncation_reasons, ("max_nodes",))
+        self.assertEqual(node_report.issues[0].kind, "maximum_nodes")
+        self.assertEqual(node_report.issues[0].path_segments, ("items", 0))
+
+    def test_iter_issues_is_lazy(self) -> None:
+        first = object()
+        second = object()
+        calls: list[object] = []
+
+        def broken_default(value: object) -> object:
+            calls.append(value)
+            raise TypeError("not supported")
+
+        issues = jsonwhy.iter_issues(
+            [first, second],
+            default=broken_default,
+            max_issues=1,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(next(issues).path, "$[0]")
+        self.assertEqual(calls, [first])
+        with self.assertRaises(StopIteration):
+            next(issues)
+        self.assertEqual(calls, [first])
+
     def test_dumps_accepts_diagnostic_controls(self) -> None:
         self.assertEqual(
             jsonwhy.dumps(
                 {"ok": True},
                 diagnostic_max_issues=1,
                 diagnostic_max_depth=0,
+                diagnostic_max_nodes=1,
                 diagnostic_include_value_repr=False,
             ),
             '{"ok": true}',
@@ -331,15 +398,30 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(caught.exception.issues[0].value_repr, "<redacted>")
         self.assertIn("<redacted>", str(caught.exception))
 
+        with self.assertRaises(jsonwhy.JsonWhyError) as node_limited:
+            jsonwhy.dumps(
+                [[object()]],
+                diagnostic_max_nodes=1,
+            )
+        self.assertTrue(node_limited.exception.report.truncated)
+        self.assertEqual(
+            node_limited.exception.report.truncation_reasons,
+            ("max_nodes",),
+        )
+
     def test_invalid_limits_raise(self) -> None:
         with self.assertRaises(ValueError):
             jsonwhy.explain({}, max_issues=0)
         with self.assertRaises(ValueError):
             jsonwhy.explain({}, max_depth=-1)
         with self.assertRaises(ValueError):
+            jsonwhy.explain({}, max_nodes=0)
+        with self.assertRaises(ValueError):
             jsonwhy.dumps({}, diagnostic_max_issues=0)
         with self.assertRaises(ValueError):
             jsonwhy.dump({}, io.StringIO(), diagnostic_max_depth=-1)
+        with self.assertRaises(ValueError):
+            jsonwhy.dumps({}, diagnostic_max_nodes=0)
 
     def test_value_repr_can_be_redacted_without_calling_repr(self) -> None:
         class SensitiveValue:
@@ -359,22 +441,23 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(issue.path, "$[<unsupported key>]")
         self.assertEqual(value.repr_calls, 0)
 
-    def test_interpreter_recursion_limit_becomes_an_issue(self) -> None:
+    def test_deep_structure_does_not_depend_on_recursion_limit(self) -> None:
         value: list[object] = []
         cursor = value
-        for _ in range(2000):
+        for _ in range(5000):
             child: list[object] = []
             cursor.append(child)
             cursor = child
         cursor.append(object())
 
         issues = jsonwhy.explain(value, max_depth=10_000)
-        self.assertEqual(issues[-1].kind, "diagnostic_recursion_limit")
+        self.assertEqual(issues[-1].kind, "unsupported_type")
+        self.assertEqual(len(issues[-1].path_segments or ()), 5001)
         with self.assertRaises(jsonwhy.JsonWhyError) as caught:
             jsonwhy.dumps(value)
         self.assertEqual(
             caught.exception.issues[-1].kind,
-            "diagnostic_recursion_limit",
+            "maximum_depth",
         )
 
     def test_dataclass_suggestion(self) -> None:

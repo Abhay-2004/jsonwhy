@@ -53,6 +53,7 @@ issues = jsonwhy.explain(payload)
 for issue in issues:
     print(issue.path)
     print(issue.json_pointer)
+    print(issue.path_segments)
     print(issue.kind)
     print(issue.suggestion)
     print(issue.as_dict())
@@ -61,7 +62,37 @@ for issue in issues:
 Each issue includes both a readable JSONPath-like `path` such as
 `$.users[0].joined` and an RFC 6901 `json_pointer` such as
 `/users/0/joined`. A pointer is `None` when the location contains a Python key
-that cannot exist in a JSON object.
+that cannot exist in a JSON object. `path_segments` provides the same location
+as structured object keys and array indexes:
+
+```python
+("users", 0, "joined")
+```
+
+Use `inspect()` when traversal metadata matters:
+
+```python
+report = jsonwhy.inspect(payload, max_nodes=100_000)
+
+print(report.ok)
+print(report.nodes_visited)
+print(report.truncated)
+print(report.truncation_reasons)
+print(report.as_dict())
+```
+
+`max_nodes` is optional and unlimited by default. A node is the root or a
+value reached through a mapping, sequence, or custom `default` result.
+
+For large payloads, issues can be consumed as they are found:
+
+```python
+for issue in jsonwhy.iter_issues(payload):
+    print(issue.path, issue.message)
+```
+
+Stopping iteration stops the inspection. Deep structures are inspected with
+an explicit traversal stack rather than Python recursion.
 
 Two shorter checks are also available:
 
@@ -81,6 +112,7 @@ jsonwhy.dumps(
     diagnostic_include_value_repr=False,
     diagnostic_max_issues=20,
     diagnostic_max_depth=200,
+    diagnostic_max_nodes=100_000,
 )
 ```
 
@@ -117,7 +149,9 @@ jsonwhy "{'payload': b'hello', 'tags': {'a', 'b'}}"
 jsonwhy --json "{'payload': b'hello'}"
 jsonwhy --path-style pointer "{'payload': b'hello'}"
 jsonwhy --max-issues 10 --max-depth 200 "{'payload': b'hello'}"
+jsonwhy --max-nodes 100000 "{'payload': b'hello'}"
 jsonwhy --json --redact-values "{'payload': b'hello'}"
+jsonwhy --json-report "{'payload': b'hello'}"
 ```
 
 Exit status `0` means compatible, `1` means issues were found, and `2` means the
